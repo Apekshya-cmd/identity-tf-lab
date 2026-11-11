@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time bootstrap for the Identity Center Terraform pipeline (the "chicken and egg" part
+  that cannot be created by the pipeline itself): Terraform state bucket, GitHub OIDC provider,
+  a read-only PLAN role (pull requests) and an APPLY role (protected 'production' environment).
+  Deploy in the MANAGEMENT account, region ap-south-1. Requires CAPABILITY_NAMED_IAM.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: Your GitHub user or organization name (exactly as in the repo URL)
+  GitHubRepo:
+    Type: String
+    Default: identity-tf-lab
+    Description: Repository name
+
+Resources:
+  # --- Terraform remote state ------------------------------------------------
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "tf-state-${AWS::AccountId}-identity-lab"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  StateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt StateBucket.Arn
+              - !Sub "${StateBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # --- GitHub OIDC provider ----------------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  # --- PLAN role: assumable only from pull requests, read-only ----------------
+  PlanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-identity-plan
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:pull_request"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: tf-plan-extras
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StateReadWriteForLocking
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt StateBucket.Arn
+                  - !Sub "${StateBucket.Arn}/*"
+              - Sid: IdentityReads
+                Effect: Allow
+                Action:
+                  - identitystore:GetGroupId
+                  - identitystore:DescribeGroup
+                  - identitystore:ListGroups
+                  - sso:Describe*
+                  - sso:List*
+                  - sso:Get*
+                  - organizations:Describe*
+                  - organizations:List*
+                Resource: "*"
+
+  # --- APPLY role: assumable only by jobs in the 'production' environment -----
+  ApplyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-identity-apply
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:production"
+      # LAB ONLY. In a real org: scope to sso:*, identitystore read, organizations policy/OU management
+      # and the state bucket.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+Outputs:
+  StateBucketName:
+    Value: !Ref StateBucket
+  PlanRoleArn:
+    Value: !GetAtt PlanRole.Arn
+  ApplyRoleArn:
+    Value: !GetAtt ApplyRole.Arn

@@ -1,0 +1,38 @@
+name: identity-terraform-destroy
+
+# Manual cleanup for the lab. Requires typing DESTROY and an approval on 'production'.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type DESTROY to remove everything this stack manages"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: identity-terraform-mgmt
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    if: github.event.inputs.confirm == 'DESTROY'
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: live/mgmt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ap-south-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+      - run: terraform init -input=false
+      - run: terraform destroy -input=false -auto-approve -no-color
